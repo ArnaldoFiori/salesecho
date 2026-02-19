@@ -1,576 +1,489 @@
-# 03 — PIPELINE TELEGRAM → TRANSCRIÇÃO → RELATÓRIO (v6)
+# 03 — PIPELINE TELEGRAM (v6)
 
 ## Status
-PENDENTE — aguardando aprovação
+APROVADO (v2: correções Spec 12)
 
 ## Decisões Canônicas
 
 | Decisão | Valor |
 |---------|-------|
 | Canal de entrada | Telegram Bot API (webhook) |
-| Código de validação | `#gravar` fixo, igual para todos |
-| Transcrição | Groq Whisper (whisper-large-v3-turbo) |
-| Sumarização | Groq Llama (llama-3.3-70b-versatile) |
-| Storage áudio | Temporário 24h no filesystem do backend |
-| Confirmação ao vendedor | Nativa do Telegram (mensagem de resposta do bot) |
-| Processamento | Síncrono fire-and-forget (webhook retorna 200 imediato, processa em background) |
-| Dedup | Índice único `(seller_id, telegram_message_id)` |
+| Formato de envio | Texto (cliente\nproduto\n#gravar) + áudio (voz ou arquivo) |
+| Sessão de correlação | **Tabela `pending_sessions` no Supabase** (persiste em restart) |
+| TTL da sessão | 10 minutos |
+| Transcrição | Groq Whisper Large v3 Turbo |
+| Sumarização | Groq Llama 3.3 70B Versatile |
+| Áudio temp | `/tmp/salesecho/audio/{recording_id}.ext` — TTL 24h |
+| Dedup | Unique index `(seller_id, telegram_message_id)` |
+| Validação webhook | **Header `X-Telegram-Bot-Api-Secret-Token`** |
 
 ---
 
-## Visão Geral do Fluxo
+## Webhook Endpoint
 
 ```
-Vendedor (Telegram)
-    │
-    ├── 1. Envia mensagem texto: "Nome Cliente\nProduto\n#gravar"
-    ├── 2. Envia áudio (voice note ou audio file)
-    │
-    ▼
-Bot Telegram (webhook POST /api/webhook/telegram)
-    │
-    ├── 3. Valida vendedor (telegram_chat_id → users)
-    ├── 4. Valida org ativa (subscription.status)
-    ├── 5. Parseia mensagem texto (extrai cliente + produto + #gravar)
-    ├── 6. Recebe áudio → download → salva temporário
-    ├── 7. Dedup check
-    │
-    ▼
-Pipeline de Processamento (background task)
-    │
-    ├── 8. Transcrição (Groq Whisper)
-    ├── 9. Sumarização (Groq Llama)
-    ├── 10. Resolve/cria customer
-    ├── 11. Salva recording completo
-    ├── 12. Responde vendedor no Telegram
-    │
-    ▼
-Portal do Gestor (leitura via RLS)
+POST /api/webhook/telegram
 ```
 
----
-
-## Fluxo Detalhado
-
-### Passo 1 — Vendedor envia mensagem de texto
-
-O vendedor envia uma mensagem de texto no Telegram com o formato:
-
-```
-Nome do Cliente
-Produto
-#gravar
-```
-
-**Regras de parsing:**
-
-| Regra | Detalhe |
-|-------|---------|
-| Separador | Quebra de linha (`\n`) |
-| Linha 1 | Nome do cliente (obrigatório, min 2 chars) |
-| Linha 2 | Produto (obrigatório, min 2 chars) |
-| Linha 3 | Deve conter `#gravar` (case-insensitive) |
-| Espaços | `TRIM()` em cada linha |
-| Linhas extras | Ignoradas |
-
-**Mensagem inválida:** bot responde com formato esperado e não processa.
+### Validação de Autenticidade
 
 ```python
-def parse_visit_message(text: str) -> dict | None:
-    """Retorna {customer_name, product} ou None se inválido."""
-    lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
-    if len(lines) < 3:
-        return None
-    if '#gravar' not in lines[2].lower():
-        return None
-    customer_name = lines[0]
-    product = lines[1]
-    if len(customer_name) < 2 or len(product) < 2:
-        return None
-    return {"customer_name": customer_name, "product": product}
+@app.post("/api/webhook/telegram")
+async def telegram_webhook(request: Request):
+    # Validar secret token (configurado no setWebhook)
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(403, "Invalid webhook secret")
+
+    payload = await request.json()
+    # Responder 200 imediatamente (Telegram espera <60s)
+    background_tasks.add_task(process_telegram_update, payload)
+    return Response(status_code=200)
 ```
 
-### Passo 2 — Vendedor envia áudio
-
-Após a mensagem de texto, o vendedor envia um áudio (voice note ou arquivo de áudio).
-
-**Formatos aceitos:** `.ogg` (voice note padrão Telegram), `.mp3`, `.m4a`, `.wav`, `.opus`
-
-**Limites:**
-
-| Limite | Valor |
-|--------|-------|
-| Duração máxima | 10 minutos (600 segundos) |
-| Tamanho máximo | 20MB (limite Telegram Bot API) |
-| Duração mínima | 3 segundos |
-
-### Passo 3 — Validação do vendedor
+### Configuração do Webhook (uma vez)
 
 ```python
-async def identify_seller(telegram_chat_id: int) -> dict | None:
-    """Busca seller por telegram_chat_id. Retorna user + org ou None."""
-    result = await db.execute(
-        """
-        SELECT u.id, u.name, u.org_id, u.is_active,
-               o.name as org_name,
-               s.status as sub_status, s.seller_limit
-        FROM users u
-        JOIN organizations o ON o.id = u.org_id
-        JOIN subscriptions s ON s.org_id = u.org_id
-        WHERE u.telegram_chat_id = :chat_id
-          AND u.role = 'seller'
-        """,
-        {"chat_id": telegram_chat_id}
+# Registrar webhook com secret token
+import httpx
+
+async def set_webhook():
+    await httpx.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+        json={
+            "url": f"{BACKEND_URL}/api/webhook/telegram",
+            "secret_token": TELEGRAM_WEBHOOK_SECRET
+        }
     )
-    return result
 ```
 
-**Cenários de rejeição:**
+---
 
-| Cenário | Resposta ao vendedor |
-|---------|---------------------|
-| `telegram_chat_id` não encontrado | "Número não cadastrado. Peça ao seu gestor para cadastrá-lo no portal SalesEcho." |
-| `is_active = false` | "Sua conta está desativada. Entre em contato com seu gestor." |
-| `sub_status = 'expired'` | "A conta da sua empresa expirou. Entre em contato com seu gestor." |
-| `sub_status = 'past_due'` (>30d) | "A conta da sua empresa está suspensa. Entre em contato com seu gestor." |
-| `sub_status = 'canceled'` | "A conta da sua empresa foi cancelada. Entre em contato com seu gestor." |
+## Comandos do Bot
 
-### Passo 4 — Verificação de acesso da org
+| Comando | Resposta |
+|---------|---------|
+| `/start` | Fluxo de vinculação (pede compartilhamento de contato) |
+| `/help` | Instruções de uso |
+| Texto com `#gravar` | Inicia sessão de gravação |
+| Áudio (voice/document) | Processa se sessão ativa |
+| Qualquer outro | Mensagem de ajuda |
 
-```python
-def is_org_active(sub_status: str) -> bool:
-    """Verifica se a org pode receber novos áudios."""
-    return sub_status in ('trial', 'active', 'past_due')
-    # past_due: ainda aceita áudios nos primeiros 30 dias
-```
-
-### Passo 5 — Estado de sessão do vendedor
-
-O bot precisa correlacionar a mensagem de texto com o áudio subsequente. Estratégia: **cache em memória com TTL**.
+### /start
 
 ```python
-# Redis ou dict em memória (MVP)
-# Chave: telegram_chat_id
-# Valor: {customer_name, product, timestamp}
-# TTL: 10 minutos
-
-pending_sessions: dict[int, dict] = {}
-
-async def handle_text_message(chat_id: int, text: str):
-    parsed = parse_visit_message(text)
-    if parsed is None:
-        await send_telegram_message(chat_id, INVALID_FORMAT_MSG)
-        return
-    pending_sessions[chat_id] = {
-        **parsed,
-        "timestamp": time.time()
+async def handle_start(chat_id: int):
+    keyboard = {
+        "keyboard": [[{
+            "text": "📱 Compartilhar meu contato",
+            "request_contact": True
+        }]],
+        "one_time_keyboard": True,
+        "resize_keyboard": True
     }
-    await send_telegram_message(
+    await send_message(
         chat_id,
-        f"✓ Cliente: {parsed['customer_name']}\n"
-        f"✓ Produto: {parsed['product']}\n\n"
-        f"Agora envie o áudio da visita."
+        "Olá! Para vincular sua conta, compartilhe seu contato "
+        "usando o botão abaixo.",
+        reply_markup=keyboard
+    )
+```
+
+### /help
+
+```python
+async def handle_help(chat_id: int):
+    await send_message(
+        chat_id,
+        "📋 *Como registrar uma visita:*\n\n"
+        "1️⃣ Envie uma mensagem com:\n"
+        "   Nome do Cliente\n"
+        "   Produto\n"
+        "   #gravar\n\n"
+        "2️⃣ Em seguida, envie o áudio da visita\n\n"
+        "⏱ Você tem 10 minutos entre o texto e o áudio.\n"
+        "🎙 Áudio máximo: 10 minutos.",
+        parse_mode="Markdown"
+    )
+```
+
+---
+
+## Fluxo Completo do Pipeline
+
+```
+Vendedor envia mensagem no Telegram
+    │
+    ├── /start → Fluxo de vinculação (pede contato)
+    ├── /help → Instruções de uso
+    ├── Contato compartilhado → Vinculação seller (normalize_phone → match)
+    │
+    ├── Texto com #gravar
+    │   ├── Seller não vinculado? → "Número não cadastrado..."
+    │   ├── Subscription inativa? → "Sua empresa não tem acesso ativo..."
+    │   ├── Parse: linha1=cliente, linha2=produto
+    │   ├── Validação: ambos obrigatórios
+    │   └── UPSERT pending_sessions (chat_id, customer_name, product)
+    │       └── Responde: "✅ Sessão aberta para {cliente} / {produto}. Envie o áudio."
+    │
+    ├── Áudio (voice ou document)
+    │   ├── Seller não vinculado? → ignora
+    │   ├── Busca pending_sessions WHERE chat_id = X AND created_at > now()-10min
+    │   │   └── Não encontrou? → "Envie primeiro: NomeCliente\nProduto\n#gravar"
+    │   ├── Dedup check: (seller_id, telegram_message_id) já existe? → 200 OK, ignora
+    │   ├── INSERT recording (status='received')
+    │   ├── DELETE pending_sessions WHERE chat_id = X
+    │   ├── Responde: "🎙 Áudio recebido! Processando..."
+    │   └── Background:
+    │       ├── Download áudio do Telegram
+    │       ├── Transcrição (Groq Whisper)
+    │       │   └── Se transcrição < 10 palavras → status='error', msg="Não foi possível identificar fala"
+    │       ├── Sumarização (Groq Llama)
+    │       ├── Resolve customer (org_id + name_normalized)
+    │       └── UPDATE recording (status='summarized')
+    │
+    └── Qualquer outro texto
+        └── Responde: "Use /help para ver como registrar uma visita."
+```
+
+---
+
+## Sessão — Tabela pending_sessions
+
+Substitui `dict` em memória. Persiste entre restarts/deploys do container.
+
+```python
+async def upsert_session(chat_id: int, customer_name: str, product: str):
+    """Cria ou atualiza sessão. UPSERT por chat_id (unique)."""
+    await db.execute(
+        """INSERT INTO pending_sessions (telegram_chat_id, customer_name, product)
+        VALUES (:chat_id, :customer, :product)
+        ON CONFLICT (telegram_chat_id)
+        DO UPDATE SET customer_name = :customer, product = :product, created_at = now()""",
+        {"chat_id": chat_id, "customer": customer_name, "product": product}
     )
 
-async def handle_audio_message(chat_id: int, message: dict):
-    session = pending_sessions.pop(chat_id, None)
-    if session is None or (time.time() - session["timestamp"]) > 600:
-        await send_telegram_message(
-            chat_id,
-            "Envie primeiro a mensagem de texto com:\n"
-            "Nome do Cliente\nProduto\n#gravar\n\n"
-            "Depois envie o áudio."
-        )
+async def get_session(chat_id: int) -> dict | None:
+    """Busca sessão ativa (< 10 min)."""
+    row = await db.fetchone(
+        """SELECT customer_name, product FROM pending_sessions
+        WHERE telegram_chat_id = :chat_id
+        AND created_at > now() - INTERVAL '10 minutes'""",
+        {"chat_id": chat_id}
+    )
+    return dict(row) if row else None
+
+async def delete_session(chat_id: int):
+    """Remove sessão após uso."""
+    await db.execute(
+        "DELETE FROM pending_sessions WHERE telegram_chat_id = :chat_id",
+        {"chat_id": chat_id}
+    )
+```
+
+---
+
+## Vinculação Seller ↔ Telegram
+
+1. Vendedor envia `/start` ou primeira mensagem
+2. Bot pede para compartilhar contato (botão `request_contact`)
+3. Telegram envia `message.contact.phone_number`
+4. Backend normaliza: `normalize_phone(phone_number)`
+5. Busca: `SELECT * FROM users WHERE phone_normalized = :phone AND role = 'seller'`
+
+```python
+async def handle_contact(chat_id: int, contact: dict):
+    phone = contact.get("phone_number", "")
+    normalized = normalize_phone(phone)
+
+    seller = await db.fetchone(
+        """SELECT u.id, u.name, u.org_id, o.name as org_name
+        FROM users u JOIN organizations o ON u.org_id = o.id
+        WHERE u.phone_normalized = :phone AND u.role = 'seller' AND u.is_active = true""",
+        {"phone": normalized}
+    )
+
+    if not seller:
+        await send_message(chat_id,
+            "❌ Número não cadastrado. Peça ao seu gestor para "
+            "cadastrá-lo no portal SalesEcho.")
         return
-    # Processa áudio com session (customer_name + product)
-    await process_recording(chat_id, session, message)
+
+    # Vincular chat_id
+    await db.execute(
+        "UPDATE users SET telegram_chat_id = :chat_id WHERE id = :id",
+        {"chat_id": chat_id, "id": seller["id"]}
+    )
+
+    # Mensagem de boas-vindas + aviso LGPD
+    await send_message(chat_id,
+        f"✅ Olá {seller['name']}! Você está vinculado à empresa "
+        f"{seller['org_name']}.\n\n"
+        "ℹ️ Seus áudios serão transcritos e resumidos por IA para "
+        "relatórios da sua empresa. Os áudios originais são deletados "
+        "em até 24 horas. Em caso de dúvidas, fale com seu gestor.\n\n"
+        "Use /help para ver como registrar uma visita.")
 ```
 
-### Passo 6 — Download e armazenamento temporário do áudio
+---
+
+## Download de Áudio
 
 ```python
-async def download_telegram_audio(file_id: str, recording_id: str) -> str:
-    """Baixa áudio do Telegram e salva localmente. Retorna path."""
-    # 1. Obter file_path via Telegram API
-    file_info = await telegram_api.get_file(file_id)
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-
-    # 2. Download
-    audio_bytes = await http_client.get(file_url)
-
-    # 3. Salvar temporário
-    ext = Path(file_info.file_path).suffix or ".ogg"
-    local_path = f"/tmp/salesecho/audio/{recording_id}{ext}"
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    Path(local_path).write_bytes(audio_bytes)
-
-    return local_path
-```
-
-**Limpeza:** cron job a cada 1h deleta arquivos com `audio_expires_at < now()`.
-
-### Passo 7 — Dedup check
-
-```python
-async def check_dedup(seller_id: str, telegram_message_id: int) -> bool:
-    """Retorna True se é duplicata."""
-    try:
-        await db.execute(
-            "INSERT INTO recordings (seller_id, telegram_message_id, ...) VALUES (...)"
+async def download_audio(file_id: str, recording_id: str) -> str:
+    """Baixa áudio do Telegram e salva localmente."""
+    async with httpx.AsyncClient() as client:
+        # Obter file_path
+        resp = await client.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id}
         )
-        return False  # Novo registro
-    except UniqueViolationError:
-        return True  # Duplicata — ignorar
+        file_path = resp.json()["result"]["file_path"]
+        ext = file_path.split(".")[-1] if "." in file_path else "ogg"
+
+        # Download
+        resp = await client.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        )
+
+        local_path = f"{AUDIO_TEMP_DIR}/{recording_id}.{ext}"
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+
+        return local_path
 ```
 
-Se duplicata: webhook retorna 200 OK sem processar.
+---
 
-### Passo 8 — Transcrição (Groq Whisper)
+## Transcrição — Groq Whisper
 
 ```python
-async def transcribe_audio(local_path: str) -> dict:
-    """Transcreve áudio via Groq Whisper API."""
-    # Status: received → transcribing
-    async with aiohttp.ClientSession() as session:
-        with open(local_path, "rb") as f:
-            form = aiohttp.FormData()
-            form.add_field("file", f, filename=Path(local_path).name)
-            form.add_field("model", "whisper-large-v3-turbo")
-            form.add_field("language", "pt")
-            form.add_field("response_format", "verbose_json")
+async def transcribe_audio(local_path: str) -> tuple[str, str]:
+    """Transcreve áudio via Groq Whisper. Retorna (texto, modelo)."""
+    model = "whisper-large-v3-turbo"
 
-            resp = await session.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=120)
-            )
-            result = await resp.json()
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                with open(local_path, "rb") as f:
+                    resp = await client.post(
+                        "https://api.groq.com/openai/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        files={"file": (os.path.basename(local_path), f)},
+                        data={"model": model, "language": "pt"}
+                    )
 
-    # Status: transcribing → transcribed
-    return {
-        "text": result["text"],
-        "duration": result.get("duration"),
-        "model": "whisper-large-v3-turbo"
-    }
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 30))
+                    logger.warning(f"Groq rate limit, retry in {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                resp.raise_for_status()
+                text = resp.json()["text"]
+
+                # Validar transcrição mínima
+                word_count = len(text.strip().split())
+                if word_count < 10:
+                    raise ValueError(
+                        f"Transcrição muito curta ({word_count} palavras). "
+                        "Não foi possível identificar fala no áudio."
+                    )
+
+                return text, model
+
+        except httpx.HTTPStatusError as e:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2 ** attempt)
+
+    raise RuntimeError("Transcrição falhou após 3 tentativas")
 ```
 
-**Tratamento de erro:**
+---
 
-| Erro | Ação |
-|------|------|
-| Timeout (>120s) | Status → `error`, `error_message = "transcription_timeout"` |
-| HTTP 429 (rate limit) | Retry com backoff exponencial (1s, 2s, 4s), máx 3 tentativas |
-| HTTP 5xx | Retry com backoff, máx 3 tentativas |
-| HTTP 4xx (exceto 429) | Status → `error`, `error_message = "transcription_failed: {status}"` |
-| Texto vazio após transcrição | Status → `error`, `error_message = "empty_transcription"` |
-
-### Passo 9 — Sumarização (Groq Llama)
+## Sumarização — Groq Llama
 
 ```python
-SUMMARY_PROMPT = """Você é um assistente de vendas. Analise a transcrição de um áudio de visita comercial e gere um resumo estruturado.
+SUMMARY_PROMPT = """Você é assistente de vendas. Analise a transcrição de uma visita comercial e gere um resumo estruturado.
 
-Dados da visita:
-- Cliente: {customer_name}
-- Produto: {product}
+Vendedor: {seller_name}
+Cliente: {customer_name}
+Produto: {product}
+Transcrição: {transcript}
 
-Transcrição do áudio:
-{transcript}
+Gere o resumo com EXATAMENTE estas seções:
+- **Contexto**: situação geral da visita (1-2 frases)
+- **Necessidades**: o que o cliente precisa ou deseja
+- **Produto**: o que foi apresentado/discutido sobre o produto
+- **Objeções**: resistências ou preocupações do cliente
+- **Próximos passos**: ações combinadas, follow-up
 
-Gere um resumo com as seguintes seções (omita seções sem informação):
-1. **Contexto**: situação geral da visita
-2. **Necessidades do cliente**: o que o cliente precisa/busca
-3. **Produto apresentado**: o que foi oferecido e como
-4. **Objeções**: resistências ou dúvidas do cliente
-5. **Próximos passos**: ações combinadas ou pendências
-6. **Observações**: qualquer outro ponto relevante
-
-Seja conciso e objetivo. Máximo 200 palavras."""
+Se alguma seção não se aplica, escreva "Não identificado".
+Seja conciso e objetivo. Máximo 300 palavras no total."""
 
 async def summarize_transcript(
-    transcript: str,
-    customer_name: str,
-    product: str
-) -> dict:
-    """Gera resumo via Groq Llama."""
-    # Status: transcribed → summarizing (implícito, não tem enum próprio)
+    transcript: str, seller_name: str, customer_name: str, product: str
+) -> tuple[str, str]:
+    """Sumariza transcrição via Groq Llama. Retorna (resumo, modelo)."""
+    model = "llama-3.3-70b-versatile"
+
     prompt = SUMMARY_PROMPT.format(
+        seller_name=seller_name,
         customer_name=customer_name,
         product=product,
         transcript=transcript
     )
 
-    async with aiohttp.ClientSession() as session:
-        resp = await session.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": "Você é um assistente de vendas que gera resumos concisos de visitas comerciais."},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 500,
-                "temperature": 0.3
-            },
-            timeout=aiohttp.ClientTimeout(total=60)
-        )
-        result = await resp.json()
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3,
+                        "max_tokens": 1024
+                    }
+                )
 
-    # Status: → summarized
-    return {
-        "text": result["choices"][0]["message"]["content"],
-        "model": "llama-3.3-70b-versatile"
-    }
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 30))
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                resp.raise_for_status()
+                summary = resp.json()["choices"][0]["message"]["content"]
+                return summary, model
+
+        except httpx.HTTPStatusError as e:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2 ** attempt)
+
+    raise RuntimeError("Sumarização falhou após 3 tentativas")
 ```
 
-**Tratamento de erro:** mesma estratégia da transcrição (retry + backoff). Se falhar após 3 tentativas, status → `error`, `error_message = "summarization_failed"`.
+---
 
-### Passo 10 — Resolver/criar customer
+## Resolução de Customer
 
 ```python
 async def resolve_customer(org_id: str, customer_name_raw: str) -> str:
-    """Retorna customer_id. Cria se não existe."""
+    """Resolve ou cria customer. Retorna customer_id."""
     name_normalized = customer_name_raw.strip().lower()
 
-    # Tenta buscar
-    result = await db.fetchone(
-        "SELECT id FROM customers WHERE org_id = :org_id AND name_normalized = :name",
+    row = await db.fetchone(
+        """SELECT id FROM customers
+        WHERE org_id = :org_id AND name_normalized = :name""",
         {"org_id": org_id, "name": name_normalized}
     )
-    if result:
-        return result["id"]
 
-    # Cria novo
-    result = await db.fetchone(
+    if row:
+        return row["id"]
+
+    row = await db.fetchone(
         """INSERT INTO customers (org_id, name, name_normalized)
-           VALUES (:org_id, :name, :name_normalized)
-           ON CONFLICT (org_id, name_normalized) DO UPDATE SET name = EXCLUDED.name
-           RETURNING id""",
+        VALUES (:org_id, :name, :name_normalized)
+        ON CONFLICT (org_id, name_normalized) DO UPDATE SET name = EXCLUDED.name
+        RETURNING id""",
         {"org_id": org_id, "name": customer_name_raw.strip(), "name_normalized": name_normalized}
     )
-    return result["id"]
-```
-
-### Passo 11 — Salvar recording completo
-
-```python
-async def save_recording(recording_id: str, data: dict):
-    """Atualiza recording com resultado do processamento."""
-    await db.execute(
-        """UPDATE recordings SET
-            customer_id = :customer_id,
-            transcript_text = :transcript_text,
-            transcript_model = :transcript_model,
-            summary_text = :summary_text,
-            summary_model = :summary_model,
-            audio_duration_sec = :audio_duration_sec,
-            status = :status,
-            processed_at = now(),
-            updated_at = now()
-        WHERE id = :id""",
-        {
-            "id": recording_id,
-            "customer_id": data["customer_id"],
-            "transcript_text": data["transcript_text"],
-            "transcript_model": data["transcript_model"],
-            "summary_text": data["summary_text"],
-            "summary_model": data["summary_model"],
-            "audio_duration_sec": data["audio_duration_sec"],
-            "status": "summarized"
-        }
-    )
-```
-
-### Passo 12 — Resposta ao vendedor
-
-```python
-SUCCESS_MSG = """✅ Visita registrada com sucesso!
-
-📋 Cliente: {customer_name}
-📦 Produto: {product}
-⏱ Duração: {duration}
-
-Resumo:
-{summary}"""
-
-ERROR_MSG = """❌ Erro ao processar seu áudio. Tente enviar novamente.
-
-Se o problema persistir, entre em contato com seu gestor."""
-
-async def notify_seller(chat_id: int, result: dict):
-    if result["status"] == "summarized":
-        msg = SUCCESS_MSG.format(
-            customer_name=result["customer_name"],
-            product=result["product"],
-            duration=format_duration(result["audio_duration_sec"]),
-            summary=result["summary_text"]
-        )
-    else:
-        msg = ERROR_MSG
-    await send_telegram_message(chat_id, msg)
+    return row["id"]
 ```
 
 ---
 
-## Webhook — Contrato API
-
-### POST /api/webhook/telegram
-
-Recebe updates do Telegram Bot API.
-
-**Request:** payload padrão Telegram Update (enviado pelo Telegram).
-
-**Response:** sempre `200 OK` com body vazio (o Telegram exige resposta rápida).
-
-**Processamento interno (background):**
+## Pipeline Background Completo
 
 ```python
-@app.post("/api/webhook/telegram")
-async def telegram_webhook(request: Request):
-    """Webhook endpoint. Retorna 200 imediato, processa em background."""
-    payload = await request.json()
-    background_tasks.add_task(process_telegram_update, payload)
-    return Response(status_code=200)
-
-async def process_telegram_update(payload: dict):
-    message = payload.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-
-    if not chat_id:
-        return
-
-    # Identificar vendedor
-    seller = await identify_seller(chat_id)
-
-    # Mensagem de texto
-    if "text" in message:
-        if seller is None:
-            # Tentativa de vinculação (primeiro contato)
-            await handle_first_contact(chat_id, message)
-            return
-        await handle_text_message(chat_id, message["text"])
-        return
-
-    # Áudio (voice note ou audio file)
-    audio = message.get("voice") or message.get("audio")
-    if audio and seller:
-        await handle_audio_message(chat_id, message)
-        return
-```
-
----
-
-## Fluxo de Vinculação (primeiro contato)
-
-Conforme Spec 01, quando o vendedor envia a primeira mensagem:
-
-```python
-async def handle_first_contact(chat_id: int, message: dict):
-    """Tenta vincular telegram_chat_id ao seller via número de celular."""
-    # Telegram envia contact info se o user compartilhou
-    contact = message.get("contact")
-    if contact:
-        phone = normalize_phone(contact.get("phone_number", ""))
-    else:
-        # Sem contact: tentar extrair do payload (user phone não está sempre disponível)
-        phone = None
-
-    if not phone:
-        await send_telegram_message(
-            chat_id,
-            "Bem-vindo ao SalesEcho! Para vincular sua conta, "
-            "envie seu contato usando o botão abaixo.",
-            reply_markup={"keyboard": [[{"text": "Compartilhar contato", "request_contact": True}]], "one_time_keyboard": True}
-        )
-        return
-
-    # Buscar seller pelo telefone normalizado
-    seller = await db.fetchone(
-        "SELECT id, name, org_id FROM users WHERE phone_normalized = :phone AND role = 'seller' AND is_active = true",
-        {"phone": phone}
-    )
-
-    if seller:
+async def process_recording(recording_id: str, file_id: str,
+                            seller: dict, session: dict):
+    """Pipeline completo: download → transcrição → sumarização → DB."""
+    try:
+        # 1. Download
+        local_path = await download_audio(file_id, recording_id)
+        expires_at = datetime.utcnow() + timedelta(hours=AUDIO_TTL_HOURS)
         await db.execute(
-            "UPDATE users SET telegram_chat_id = :chat_id WHERE id = :id",
-            {"chat_id": chat_id, "id": seller["id"]}
+            """UPDATE recordings SET
+                audio_local_path = :path, audio_expires_at = :expires,
+                status = 'transcribing', updated_at = now()
+            WHERE id = :id""",
+            {"path": local_path, "expires": expires_at, "id": recording_id}
         )
-        org = await db.fetchone("SELECT name FROM organizations WHERE id = :id", {"id": seller["org_id"]})
-        await send_telegram_message(
-            chat_id,
-            f"✅ Olá {seller['name']}! Você está vinculado à empresa {org['name']}.\n\n"
-            f"Para registrar uma visita, envie:\n"
-            f"Nome do Cliente\nProduto\n#gravar\n\n"
-            f"Depois envie o áudio."
+        pipeline_metrics.record(True)  # download ok
+
+        # 2. Transcrição
+        transcript, t_model = await transcribe_audio(local_path)
+        await db.execute(
+            """UPDATE recordings SET
+                transcript_text = :text, transcript_model = :model,
+                status = 'transcribed', updated_at = now()
+            WHERE id = :id""",
+            {"text": transcript, "model": t_model, "id": recording_id}
         )
-    else:
-        await send_telegram_message(
-            chat_id,
-            "Número não cadastrado. Peça ao seu gestor para cadastrá-lo no portal SalesEcho."
+        pipeline_metrics.record(True)
+
+        # 3. Sumarização
+        summary, s_model = await summarize_transcript(
+            transcript, seller["name"],
+            session["customer_name"], session["product"]
         )
+
+        # 4. Resolver customer
+        customer_id = await resolve_customer(
+            seller["org_id"], session["customer_name"]
+        )
+
+        # 5. Finalizar
+        await db.execute(
+            """UPDATE recordings SET
+                summary_text = :summary, summary_model = :s_model,
+                customer_id = :customer_id, status = 'summarized',
+                processed_at = now(), updated_at = now()
+            WHERE id = :id""",
+            {"summary": summary, "s_model": s_model,
+             "customer_id": customer_id, "id": recording_id}
+        )
+        pipeline_metrics.record(True)
+
+        # Notificar vendedor
+        await send_message(seller["telegram_chat_id"],
+            f"✅ Visita registrada!\n"
+            f"Cliente: {session['customer_name']}\n"
+            f"Produto: {session['product']}")
+
+    except Exception as e:
+        logger.error(f"Pipeline error for recording {recording_id}: {e}", exc_info=True)
+        pipeline_metrics.record(False)
+        await db.execute(
+            """UPDATE recordings SET
+                status = 'error', error_message = :error, updated_at = now()
+            WHERE id = :id""",
+            {"error": str(e)[:500], "id": recording_id}
+        )
+        await send_message(seller["telegram_chat_id"],
+            "❌ Erro ao processar seu áudio. Tente novamente.")
 ```
 
 ---
 
-## Mensagens do Bot (catálogo completo)
+## Verificação de Subscription Ativa
 
-| Código | Mensagem |
-|--------|----------|
-| `WELCOME_LINKED` | "✅ Olá {nome}! Você está vinculado à empresa {org}. Para registrar uma visita, envie: Nome do Cliente\nProduto\n#gravar\n\nDepois envie o áudio." |
-| `NOT_REGISTERED` | "Número não cadastrado. Peça ao seu gestor para cadastrá-lo no portal SalesEcho." |
-| `SHARE_CONTACT` | "Bem-vindo ao SalesEcho! Para vincular sua conta, envie seu contato usando o botão abaixo." |
-| `ACCOUNT_INACTIVE` | "Sua conta está desativada. Entre em contato com seu gestor." |
-| `ORG_EXPIRED` | "A conta da sua empresa expirou. Entre em contato com seu gestor." |
-| `ORG_SUSPENDED` | "A conta da sua empresa está suspensa. Entre em contato com seu gestor." |
-| `INVALID_FORMAT` | "Formato inválido. Envie:\n\nNome do Cliente\nProduto\n#gravar\n\nDepois envie o áudio." |
-| `TEXT_RECEIVED` | "✓ Cliente: {customer_name}\n✓ Produto: {product}\n\nAgora envie o áudio da visita." |
-| `AUDIO_NO_SESSION` | "Envie primeiro a mensagem de texto com:\nNome do Cliente\nProduto\n#gravar\n\nDepois envie o áudio." |
-| `AUDIO_TOO_SHORT` | "Áudio muito curto (mínimo 3 segundos). Envie novamente." |
-| `AUDIO_TOO_LONG` | "Áudio muito longo (máximo 10 minutos). Envie um áudio mais curto." |
-| `PROCESSING` | "⏳ Processando seu áudio..." |
-| `SUCCESS` | "✅ Visita registrada! (ver Passo 12)" |
-| `ERROR` | "❌ Erro ao processar seu áudio. Tente enviar novamente." |
+Antes de processar qualquer mensagem de vendedor, verificar se a org tem acesso:
 
----
-
-## Tratamento de Erros — Resumo
-
-| Etapa | Erro | Retry | Fallback |
-|-------|------|-------|----------|
-| Download áudio | Timeout/HTTP error | 2 tentativas | Status `error`, notifica vendedor |
-| Transcrição | Timeout (>120s) | 3 tentativas, backoff | Status `error`, notifica vendedor |
-| Transcrição | Rate limit (429) | 3 tentativas, backoff | Status `error`, notifica vendedor |
-| Transcrição | Texto vazio | Sem retry | Status `error`, notifica vendedor |
-| Sumarização | Timeout/erro | 3 tentativas, backoff | Status `error`, notifica vendedor |
-| Salvar DB | Erro SQL | Sem retry | Log + status `error` |
-| Notificar vendedor | Telegram API error | 2 tentativas | Log (não crítico) |
-
----
-
-## Referências v3 Aproveitáveis
-
-| Função v3 | Reuso em v6 |
-|-----------|-------------|
-| `parse_visit_message()` | Adaptar — v3 parseava formato similar |
-| `transcribe_audio()` | Adaptar — mudar de OpenAI para Groq endpoint |
-| `generate_summary()` | Adaptar — mudar modelo e prompt |
-| `normalize_phone()` | Copiar direto |
-| Rate limit/retry logic | Copiar padrão de backoff |
-
----
-
-## Configurações (env vars)
-
-| Variável | Descrição |
-|----------|-----------|
-| `TELEGRAM_BOT_TOKEN` | Token do bot Telegram |
-| `TELEGRAM_WEBHOOK_SECRET` | Secret para validar requests do Telegram |
-| `GROQ_API_KEY` | API key do Groq |
-| `AUDIO_TEMP_DIR` | Diretório temporário para áudios (default: `/tmp/salesecho/audio`) |
-| `AUDIO_TTL_HOURS` | TTL dos áudios temporários (default: 24) |
-| `AUDIO_MAX_DURATION_SEC` | Duração máxima do áudio (default: 600) |
-| `AUDIO_MIN_DURATION_SEC` | Duração mínima do áudio (default: 3) |
+```python
+async def check_seller_access(seller_id: str) -> bool:
+    """Verifica se seller tem org com subscription ativa."""
+    row = await db.fetchone(
+        """SELECT s.status FROM subscriptions s
+        JOIN users u ON u.org_id = s.org_id
+        WHERE u.id = :seller_id""",
+        {"seller_id": seller_id}
+    )
+    if not row:
+        return False
+    return row["status"] in ("trial", "active", "pending_payment")
+```

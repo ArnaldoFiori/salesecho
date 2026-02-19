@@ -1,7 +1,7 @@
 # 02 — DDL COMPLETO (v6)
 
 ## Status
-PENDENTE — aguardando aprovação
+APROVADO (v2: correções Spec 12)
 
 ## Decisões Canônicas
 
@@ -12,8 +12,10 @@ PENDENTE — aguardando aprovação
 | Auth | Supabase Auth (`auth.users`) — tabela gerenciada, não criada por nós |
 | UUIDs | `gen_random_uuid()` nativo do PostgreSQL |
 | Timestamps | `timestamptz`, default `now()` |
+| Timezone interna | **UTC sempre** — conversão para BRT apenas na exibição |
 | Soft delete | Não — hard delete (simplicidade MVP) |
 | Enums | PostgreSQL ENUM types |
+| Org admins | **1 por org no MVP** — controlado pela aplicação |
 
 ---
 
@@ -22,7 +24,14 @@ PENDENTE — aguardando aprovação
 ```sql
 CREATE TYPE user_role AS ENUM ('system_admin', 'org_admin', 'seller');
 
-CREATE TYPE subscription_status AS ENUM ('trial', 'active', 'past_due', 'canceled', 'expired');
+CREATE TYPE subscription_status AS ENUM (
+    'trial',
+    'pending_payment',
+    'active',
+    'past_due',
+    'canceled',
+    'expired'
+);
 
 CREATE TYPE recording_status AS ENUM ('received', 'transcribing', 'transcribed', 'summarized', 'error');
 ```
@@ -32,8 +41,6 @@ CREATE TYPE recording_status AS ENUM ('received', 'transcribing', 'transcribed',
 ## Tabelas
 
 ### 1. organizations
-
-Raiz do multi-tenancy. Uma org = uma empresa cliente.
 
 ```sql
 CREATE TABLE organizations (
@@ -47,11 +54,7 @@ CREATE TABLE organizations (
 CREATE INDEX idx_organizations_created_at ON organizations (created_at);
 ```
 
----
-
 ### 2. users
-
-Usuários do sistema. Vinculados a `auth.users` via `auth_user_id`. Sellers não têm login no portal.
 
 ```sql
 CREATE TABLE users (
@@ -70,9 +73,6 @@ CREATE TABLE users (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- auth_user_id é NULL para sellers (não têm login)
--- phone_normalized: resultado de normalize_phone() para match com Telegram
-
 CREATE INDEX idx_users_org_id ON users (org_id);
 CREATE INDEX idx_users_auth_user_id ON users (auth_user_id);
 CREATE INDEX idx_users_phone_normalized ON users (phone_normalized);
@@ -80,11 +80,7 @@ CREATE INDEX idx_users_telegram_chat_id ON users (telegram_chat_id);
 CREATE INDEX idx_users_org_role ON users (org_id, role);
 ```
 
----
-
 ### 3. subscriptions
-
-Uma subscription por org. Controla trial, pagamento e acesso.
 
 ```sql
 CREATE TABLE subscriptions (
@@ -100,21 +96,11 @@ CREATE TABLE subscriptions (
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- trial: seller_limit=5, trial_ends_at=now()+30d
--- active: seller_limit conforme plano Stripe
--- past_due: 30d tolerância read-only
--- expired: trial expirado sem pagamento → dados serão deletados
--- canceled: assinante cancelou → dados preservados
-
 CREATE INDEX idx_subscriptions_status ON subscriptions (status);
 CREATE INDEX idx_subscriptions_trial_ends ON subscriptions (trial_ends_at) WHERE status = 'trial';
 ```
 
----
-
 ### 4. customers
-
-Clientes/prospects mencionados pelos vendedores nos áudios. Resolução por org_id + nome normalizado.
 
 ```sql
 CREATE TABLE customers (
@@ -125,17 +111,10 @@ CREATE TABLE customers (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- name_normalized: LOWER(TRIM(name)) para match case-insensitive
--- Resolução: busca por org_id + name_normalized; se não existe, cria
-
 CREATE UNIQUE INDEX idx_customers_org_name ON customers (org_id, name_normalized);
 ```
 
----
-
 ### 5. recordings
-
-Cada envio de áudio pelo vendedor via Telegram.
 
 ```sql
 CREATE TABLE recordings (
@@ -161,29 +140,37 @@ CREATE TABLE recordings (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- customer_name_raw: nome digitado pelo vendedor antes de resolver
--- product_raw: produto digitado pelo vendedor
--- audio_local_path: caminho temporário (fallback 24h)
--- audio_expires_at: now()+24h, cron limpa após expirar
--- transcript_text/summary_text: resultado do processamento inline
--- error_message: preenchido quando status='error'
-
 CREATE INDEX idx_recordings_org_id ON recordings (org_id);
 CREATE INDEX idx_recordings_seller_id ON recordings (seller_id);
 CREATE INDEX idx_recordings_customer_id ON recordings (customer_id);
 CREATE INDEX idx_recordings_status ON recordings (status) WHERE status IN ('received', 'transcribing', 'error');
 CREATE INDEX idx_recordings_created_at ON recordings (org_id, created_at DESC);
 CREATE INDEX idx_recordings_audio_cleanup ON recordings (audio_expires_at) WHERE audio_local_path IS NOT NULL;
-
--- Dedup: mesmo vendedor + mesmo telegram_message_id = duplicata
 CREATE UNIQUE INDEX idx_recordings_dedup ON recordings (seller_id, telegram_message_id);
 ```
 
----
+### 6. pending_sessions
 
-### 6. support_audit
+Sessões temporárias do bot Telegram. Correlaciona mensagem de texto com áudio subsequente. **Persiste em DB** (resiste a restart/deploy do container).
 
-Log de ações do system_admin ao acessar dados de outras orgs.
+```sql
+CREATE TABLE pending_sessions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    telegram_chat_id BIGINT NOT NULL UNIQUE,
+    customer_name   TEXT NOT NULL,
+    product         TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- TTL de 10 min controlado pela aplicação
+-- Cleanup via cron a cada 1h
+-- SEM RLS — acessada somente pelo backend via service_role
+
+CREATE INDEX idx_pending_sessions_chat_id ON pending_sessions (telegram_chat_id);
+CREATE INDEX idx_pending_sessions_created ON pending_sessions (created_at);
+```
+
+### 7. support_audit
 
 ```sql
 CREATE TABLE support_audit (
@@ -203,8 +190,6 @@ CREATE INDEX idx_support_audit_user ON support_audit (user_id, created_at DESC);
 
 ## RLS Policies
 
-### Habilitar RLS em todas as tabelas
-
 ```sql
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
@@ -212,9 +197,10 @@ ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE recordings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE support_audit ENABLE ROW LEVEL SECURITY;
+-- pending_sessions: SEM RLS (backend only via service_role)
 ```
 
-### Função auxiliar: org_id do usuário logado
+### Funções auxiliares
 
 ```sql
 CREATE OR REPLACE FUNCTION get_user_org_id()
@@ -231,95 +217,60 @@ $$ LANGUAGE sql SECURITY DEFINER STABLE;
 ### Policies — organizations
 
 ```sql
--- org_admin vê somente própria org
-CREATE POLICY "org_admin_select_own_org"
-    ON organizations FOR SELECT
+CREATE POLICY "org_admin_select_own_org" ON organizations FOR SELECT
     USING (id = get_user_org_id());
-
--- system_admin vê todas
-CREATE POLICY "system_admin_select_all_orgs"
-    ON organizations FOR SELECT
+CREATE POLICY "system_admin_select_all_orgs" ON organizations FOR SELECT
     USING (get_user_role() = 'system_admin');
 ```
 
 ### Policies — users
 
 ```sql
--- org_admin vê/gerencia sellers da própria org
-CREATE POLICY "org_admin_select_org_users"
-    ON users FOR SELECT
+CREATE POLICY "org_admin_select_org_users" ON users FOR SELECT
     USING (org_id = get_user_org_id());
-
-CREATE POLICY "org_admin_insert_sellers"
-    ON users FOR INSERT
-    WITH CHECK (
-        org_id = get_user_org_id()
-        AND role = 'seller'
-    );
-
-CREATE POLICY "org_admin_update_sellers"
-    ON users FOR UPDATE
-    USING (
-        org_id = get_user_org_id()
-        AND role = 'seller'
-    );
-
--- system_admin vê todos
-CREATE POLICY "system_admin_select_all_users"
-    ON users FOR SELECT
+CREATE POLICY "org_admin_insert_sellers" ON users FOR INSERT
+    WITH CHECK (org_id = get_user_org_id() AND role = 'seller');
+CREATE POLICY "org_admin_update_sellers" ON users FOR UPDATE
+    USING (org_id = get_user_org_id() AND role = 'seller');
+CREATE POLICY "system_admin_select_all_users" ON users FOR SELECT
     USING (get_user_role() = 'system_admin');
 ```
 
 ### Policies — subscriptions
 
 ```sql
-CREATE POLICY "org_admin_select_own_subscription"
-    ON subscriptions FOR SELECT
+CREATE POLICY "org_admin_select_own_subscription" ON subscriptions FOR SELECT
     USING (org_id = get_user_org_id());
-
-CREATE POLICY "system_admin_select_all_subscriptions"
-    ON subscriptions FOR SELECT
+CREATE POLICY "system_admin_select_all_subscriptions" ON subscriptions FOR SELECT
     USING (get_user_role() = 'system_admin');
 ```
 
 ### Policies — customers
 
 ```sql
-CREATE POLICY "org_select_own_customers"
-    ON customers FOR SELECT
+CREATE POLICY "org_select_own_customers" ON customers FOR SELECT
     USING (org_id = get_user_org_id());
-
-CREATE POLICY "org_insert_own_customers"
-    ON customers FOR INSERT
+CREATE POLICY "org_insert_own_customers" ON customers FOR INSERT
     WITH CHECK (org_id = get_user_org_id());
-
-CREATE POLICY "system_admin_select_all_customers"
-    ON customers FOR SELECT
+CREATE POLICY "system_admin_select_all_customers" ON customers FOR SELECT
     USING (get_user_role() = 'system_admin');
 ```
 
 ### Policies — recordings
 
 ```sql
-CREATE POLICY "org_select_own_recordings"
-    ON recordings FOR SELECT
+CREATE POLICY "org_select_own_recordings" ON recordings FOR SELECT
     USING (org_id = get_user_org_id());
-
-CREATE POLICY "system_admin_select_all_recordings"
-    ON recordings FOR SELECT
+CREATE POLICY "system_admin_select_all_recordings" ON recordings FOR SELECT
     USING (get_user_role() = 'system_admin');
 ```
 
 ### Policies — support_audit
 
 ```sql
--- Somente system_admin vê audit logs
-CREATE POLICY "system_admin_select_audit"
-    ON support_audit FOR SELECT
+CREATE POLICY "system_admin_select_audit" ON support_audit FOR SELECT
     USING (get_user_role() = 'system_admin');
-
-CREATE POLICY "system_admin_insert_audit"
-    ON support_audit FOR INSERT
+CREATE POLICY "system_admin_insert_audit" ON support_audit FOR INSERT
     WITH CHECK (get_user_role() = 'system_admin');
 ```
 
@@ -338,24 +289,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_organizations_updated_at
-    BEFORE UPDATE ON organizations
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-
-CREATE TRIGGER trg_users_updated_at
-    BEFORE UPDATE ON users
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-
-CREATE TRIGGER trg_subscriptions_updated_at
-    BEFORE UPDATE ON subscriptions
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-
-CREATE TRIGGER trg_recordings_updated_at
-    BEFORE UPDATE ON recordings
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_organizations_updated_at BEFORE UPDATE ON organizations FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_subscriptions_updated_at BEFORE UPDATE ON subscriptions FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_recordings_updated_at BEFORE UPDATE ON recordings FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 ```
 
-### Trigger de onboarding (pós-signup)
+### Trigger de onboarding
 
 ```sql
 CREATE OR REPLACE FUNCTION handle_new_user_signup()
@@ -363,7 +303,6 @@ RETURNS TRIGGER AS $$
 DECLARE
     new_org_id UUID;
 BEGIN
-    -- Criar organization
     INSERT INTO organizations (name, estimated_sellers)
     VALUES (
         NEW.raw_user_meta_data->>'company_name',
@@ -371,25 +310,16 @@ BEGIN
     )
     RETURNING id INTO new_org_id;
 
-    -- Criar user (org_admin)
     INSERT INTO users (auth_user_id, org_id, name, email, role, job_title)
     VALUES (
-        NEW.id,
-        new_org_id,
+        NEW.id, new_org_id,
         NEW.raw_user_meta_data->>'full_name',
-        NEW.email,
-        'org_admin',
+        NEW.email, 'org_admin',
         NEW.raw_user_meta_data->>'job_title'
     );
 
-    -- Criar subscription (trial)
     INSERT INTO subscriptions (org_id, status, trial_ends_at, seller_limit)
-    VALUES (
-        new_org_id,
-        'trial',
-        now() + INTERVAL '30 days',
-        5
-    );
+    VALUES (new_org_id, 'trial', now() + INTERVAL '30 days', 5);
 
     RETURN NEW;
 END;
@@ -402,14 +332,17 @@ CREATE TRIGGER on_auth_user_created
 
 ---
 
-## Cron Jobs (via pg_cron ou backend)
+## Cron Jobs
 
-| Job | Frequência | Ação |
-|-----|-----------|------|
-| Limpar áudios expirados | A cada 1h | `DELETE audio_local_path WHERE audio_expires_at < now()` |
-| Expirar trials | Diário 00:00 UTC | `UPDATE subscriptions SET status='expired' WHERE status='trial' AND trial_ends_at < now()` |
-| Deletar dados de trials expirados | Diário 01:00 UTC | `DELETE FROM organizations WHERE id IN (SELECT org_id FROM subscriptions WHERE status='expired' AND trial_ends_at < now() - INTERVAL '7 days')` — 7 dias de graça após expiração |
-| Marcar inadimplência | Diário 00:00 UTC | `UPDATE subscriptions SET status='past_due' WHERE status='active' AND current_period_end < now()` |
+Todos os horários em **UTC**.
+
+| Job | Frequência | Horário UTC | Ação |
+|-----|-----------|-------------|------|
+| Limpar áudios expirados | 1h | — | `UPDATE recordings SET audio_local_path = NULL WHERE audio_expires_at < now() AND audio_local_path IS NOT NULL` |
+| Limpar sessões expiradas | 1h | — | `DELETE FROM pending_sessions WHERE created_at < now() - INTERVAL '10 minutes'` |
+| Expirar trials | Diário | 03:00 | `UPDATE subscriptions SET status='expired' WHERE status='trial' AND trial_ends_at < now()` |
+| Deletar dados trials | Diário | 04:00 | `DELETE FROM organizations WHERE id IN (SELECT org_id FROM subscriptions WHERE status='expired' AND trial_ends_at < now() - INTERVAL '7 days')` |
+| Marcar inadimplência | Diário | 03:00 | `UPDATE subscriptions SET status='past_due' WHERE status='active' AND current_period_end < now()` |
 
 ---
 
@@ -430,20 +363,6 @@ auth.users (Supabase gerenciado)
             └──> support_audit.user_id
 
 recordings.customer_id ──> customers.id
+
+pending_sessions (standalone, sem FK — TTL 10 min)
 ```
-
----
-
-## Notas de Implementação
-
-1. **Backend (FastAPI) usa service_role key** para operações de escrita no pipeline Telegram (bypass RLS). O frontend usa anon key com RLS ativo.
-
-2. **Normalização de customer**: `name_normalized = LOWER(TRIM(customer_name_raw))`. Match por `org_id + name_normalized`. Se não existe, INSERT automático.
-
-3. **Dedup de recordings**: índice único em `(seller_id, telegram_message_id)`. Se duplicata, retorna 200 OK sem reprocessar.
-
-4. **phone_normalized**: preenchido via trigger ou aplicação ao inserir/atualizar phone. Formato: somente dígitos com DDI (ex: `5511999998888`).
-
-5. **Cascade deletes**: ao deletar `organizations`, cascateia para `users`, `subscriptions`, `customers`, `recordings`, `support_audit`.
-
-6. **Trial expirado + 7 dias de graça**: dados são deletados 7 dias após expiração do trial (janela para o gestor assinar). Aviso no portal durante esses 7 dias.
