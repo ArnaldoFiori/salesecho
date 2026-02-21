@@ -1,9 +1,16 @@
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI
 from app.config import settings
 from app.middleware import setup_middleware
 from app import database as db
+from app.routers.webhook_telegram import router as telegram_router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":"%(message)s"}',
+)
 
 
 @asynccontextmanager
@@ -20,6 +27,7 @@ app = FastAPI(
 )
 
 setup_middleware(app)
+app.include_router(telegram_router)
 
 
 @app.get("/health")
