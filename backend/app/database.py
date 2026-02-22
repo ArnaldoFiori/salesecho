@@ -11,6 +11,7 @@ async def get_pool() -> asyncpg.Pool:
             settings.DATABASE_URL,
             min_size=2,
             max_size=10,
+            statement_cache_size=0,
         )
     return pool
 

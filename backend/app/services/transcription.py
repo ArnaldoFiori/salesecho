@@ -29,6 +29,10 @@ async def transcribe_audio(local_path: str) -> tuple[str, str]:
                     await asyncio.sleep(retry_after)
                     continue
 
+                if resp.status_code == 400:
+                    error_body = resp.text
+                    logger.error(f"Groq 400 error: {error_body}")
+                    raise RuntimeError(f"Groq rejected audio: {error_body[:200]}")
                 resp.raise_for_status()
                 text = resp.json()["text"]
 

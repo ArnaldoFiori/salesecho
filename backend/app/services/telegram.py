@@ -25,6 +25,8 @@ async def get_file_url(file_id: str) -> tuple[str, str]:
         resp.raise_for_status()
         file_path = resp.json()["result"]["file_path"]
         ext = file_path.split(".")[-1] if "." in file_path else "ogg"
+        if ext == "oga":
+            ext = "ogg"
         url = f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file_path}"
         return url, ext
 
