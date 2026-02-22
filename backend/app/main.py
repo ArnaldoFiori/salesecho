@@ -6,6 +6,11 @@ from app.config import settings
 from app.middleware import setup_middleware
 from app import database as db
 from app.routers.webhook_telegram import router as telegram_router
+from app.routers.stats import router as stats_router
+from app.routers.recordings import router as recordings_router
+from app.routers.sellers import router as sellers_router
+from app.routers.account import router as account_router
+from app.routers.admin import router as admin_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +33,11 @@ app = FastAPI(
 
 setup_middleware(app)
 app.include_router(telegram_router)
+app.include_router(stats_router)
+app.include_router(recordings_router)
+app.include_router(sellers_router)
+app.include_router(account_router)
+app.include_router(admin_router)
 
 
 @app.get("/health")
@@ -38,7 +48,6 @@ async def health():
 @app.get("/health/deep")
 async def health_deep():
     checks = {}
-
     try:
         result = await db.fetchval("SELECT 1")
         checks["database"] = "ok" if result == 1 else "error"
