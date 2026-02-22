@@ -3,6 +3,7 @@ from pydantic import BaseModel, field_validator
 from app.auth import CurrentUser, require_org_admin
 from app import database as db
 from app.services.phone import normalize_phone
+from app.services.stripe_sync import sync_seller_quantity
 
 router = APIRouter(prefix="/api", tags=["sellers"])
 
@@ -104,6 +105,8 @@ async def create_seller(body: SellerCreate, user: CurrentUser = Depends(require_
         [user.org_id, body.name.strip(), body.phone, phone_normalized],
     )
 
+    await sync_seller_quantity(user.org_id)
+
     return {
         "id": str(row["id"]),
         "name": row["name"],
@@ -162,6 +165,7 @@ async def update_seller(seller_id: str, body: SellerUpdate, user: CurrentUser = 
     params.extend([seller_id, user.org_id])
 
     await db.execute(query, params)
+    await sync_seller_quantity(user.org_id)
     return {"message": "Seller atualizado"}
 
 

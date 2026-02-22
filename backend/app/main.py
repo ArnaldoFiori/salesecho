@@ -11,6 +11,7 @@ from app.routers.recordings import router as recordings_router
 from app.routers.sellers import router as sellers_router
 from app.routers.account import router as account_router
 from app.routers.admin import router as admin_router
+from app.routers.billing import router as billing_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +39,7 @@ app.include_router(recordings_router)
 app.include_router(sellers_router)
 app.include_router(account_router)
 app.include_router(admin_router)
+app.include_router(billing_router)
 
 
 @app.get("/health")
