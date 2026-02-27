@@ -9,6 +9,7 @@ import Dashboard from './pages/Dashboard'
 import Recordings from './pages/Recordings'
 import RecordingDetail from './pages/RecordingDetail'
 import Sellers from './pages/Sellers'
+import SellerForm from './pages/SellerForm'
 import Account from './pages/Account'
 
 function App() {
@@ -24,8 +25,8 @@ function App() {
           <Route path="/recordings" element={<PrivateRoute><Layout><Recordings /></Layout></PrivateRoute>} />
           <Route path="/recordings/:id" element={<PrivateRoute><Layout><RecordingDetail /></Layout></PrivateRoute>} />
           <Route path="/sellers" element={<PrivateRoute><Layout><Sellers /></Layout></PrivateRoute>} />
-          <Route path="/sellers/new" element={<PrivateRoute><Layout><Sellers /></Layout></PrivateRoute>} />
-          <Route path="/sellers/:id" element={<PrivateRoute><Layout><Sellers /></Layout></PrivateRoute>} />
+          <Route path="/sellers/new" element={<PrivateRoute><Layout><SellerForm /></Layout></PrivateRoute>} />
+          <Route path="/sellers/:id" element={<PrivateRoute><Layout><SellerForm /></Layout></PrivateRoute>} />
           <Route path="/account" element={<PrivateRoute><Layout><Account /></Layout></PrivateRoute>} />
 
           <Route path="*" element={<Navigate to="/login" replace />} />
