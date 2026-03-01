@@ -15,9 +15,9 @@ api.interceptors.request.use(async (config) => {
 
 api.interceptors.response.use(
   (res) => res,
-  (err) => {
+  async (err) => {
     if (err.response?.status === 401) {
-      window.location.href = '/login'
+      await supabase.auth.signOut()
     }
     return Promise.reject(err)
   }
