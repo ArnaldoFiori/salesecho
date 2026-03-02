@@ -18,13 +18,13 @@ logging.basicConfig(
     format='{"time":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":"%(message)s"}',
 )
 
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await db.get_pool()
+    logger.info("Application starting up")
     yield
     await db.close_pool()
-
 
 app = FastAPI(
     title="SalesEcho API",
@@ -33,6 +33,7 @@ app = FastAPI(
 )
 
 setup_middleware(app)
+
 app.include_router(telegram_router)
 app.include_router(stats_router)
 app.include_router(recordings_router)
@@ -41,11 +42,9 @@ app.include_router(account_router)
 app.include_router(admin_router)
 app.include_router(billing_router)
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
-
 
 @app.get("/health/deep")
 async def health_deep():
@@ -55,6 +54,5 @@ async def health_deep():
         checks["database"] = "ok" if result == 1 else "error"
     except Exception as e:
         checks["database"] = f"error: {str(e)[:100]}"
-
     status = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
     return {"status": status, "checks": checks}
