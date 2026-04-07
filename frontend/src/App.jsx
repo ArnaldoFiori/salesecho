@@ -11,6 +11,7 @@ import RecordingDetail from './pages/RecordingDetail'
 import Sellers from './pages/Sellers'
 import SellerForm from './pages/SellerForm'
 import Account from './pages/Account'
+import Privacidade from './pages/Privacidade'
 
 function App() {
   return (
@@ -19,6 +20,7 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/signup" element={<Signup />} />
+          <Route path="/privacidade" element={<Privacidade />} />
           <Route path="/forgot-password" element={<ForgotPassword />} />
 
           <Route path="/dashboard" element={<PrivateRoute><Layout><Dashboard /></Layout></PrivateRoute>} />
